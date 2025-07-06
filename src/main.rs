@@ -355,10 +355,10 @@ mod global_hook_simulator {
 // 这是最“正确”但也是最复杂的方法。
 // 由于其极端复杂性，提供一个完整的、健壮的示例非常困难。
 // 下面的代码是一个“概念验证”，展示了其基本思路，但省略了大量的错误处理和复杂的逻辑。
-mod ui_automation_conceptual {
-    use std::{thread, time::Duration};
+mod ui_automation_improved {
+    use std::{thread, time::Duration, sync::atomic::{AtomicBool, Ordering}};
     use windows::{
-        core::ComInterface,
+        core::{ComInterface, HSTRING},
         Win32::{
             System::Com::{
                 CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -366,76 +366,177 @@ mod ui_automation_conceptual {
             },
             UI::Accessibility::{
                 CUIAutomation, IUIAutomation, IUIAutomationTextPattern, UIA_TextPatternId,
+                IUIAutomationElement, UIA_ValuePatternId, IUIAutomationValuePattern,
+                UIA_EditControlTypeId, UIA_DocumentControlTypeId, UIA_TextControlTypeId,
             },
+            Foundation::{HWND, POINT},
+            UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW, GetCursorPos, WindowFromPoint},
         },
     };
 
-    pub fn run() {
-        println!("方法二：UI Automation 模式 (概念示例)。");
-        println!("这个示例将尝试获取当前焦点窗口中选中的文本。");
-        println!("注意：这非常复杂，且不保证对所有应用都有效。");
+    static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 
-        unsafe {
-            if let Err(e) = CoInitializeEx(None, COINIT_MULTITHREADED) {
-                println!("COM 初始化失败: {:?}", e);
-                return;
-            }
-
-            let automation: IUIAutomation =
-                match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
-                    Ok(inst) => inst,
-                    Err(e) => {
-                        println!("创建 UI Automation 实例失败: {:?}", e);
-                        CoUninitialize();
-                        return;
-                    }
-                };
-
-            println!("请在 5 秒内切换到另一个窗口并选中文本...");
-            thread::sleep(Duration::from_secs(5));
-
-            match automation.GetFocusedElement() {
-                Ok(focused_element) => {
-                    println!("成功获取到焦点元素。正在尝试获取文本模式...");
-                    
-                    match focused_element.GetCurrentPattern(UIA_TextPatternId) {
-                        Ok(pattern_unknown) => {
-                            // 需要将获取到的 IUnknown 转换为 IUIAutomationTextPattern
-                            match pattern_unknown.cast::<IUIAutomationTextPattern>() {
-                                Ok(text_pattern) => {
-                                    println!("成功获取文本模式。正在获取选区...");
-                                    match text_pattern.GetSelection() {
-                                        Ok(selection) => {
-                                            let selection_len = selection.Length().unwrap_or(0);
-                                            if selection_len > 0 {
-                                                println!("找到 {} 个选区。", selection_len);
-                                                for i in 0..selection_len {
-                                                    if let Ok(range) = selection.GetElement(i) {
-                                                        if let Ok(text) = range.GetText(-1) {
-                                                            println!("--- [UIA 捕获内容] ---");
-                                                            println!("{}", text.to_string());
-                                                            println!("--- [内容结束] ---\n");
-                                                        }
-                                                    }
-                                                }
-                                            } else {
-                                                println!("未找到任何选区。");
-                                            }
-                                        }
-                                        Err(e) => println!("获取选区失败: {:?}", e),
+    // 尝试从元素获取选中的文本
+    unsafe fn try_get_selected_text(element: &IUIAutomationElement) -> Option<String> {
+        // 方法1: 尝试 TextPattern
+        if let Ok(pattern_unknown) = element.GetCurrentPattern(UIA_TextPatternId) {
+            if let Ok(text_pattern) = pattern_unknown.cast::<IUIAutomationTextPattern>() {
+                if let Ok(selection) = text_pattern.GetSelection() {
+                    let selection_len = selection.Length().unwrap_or(0);
+                    if selection_len > 0 {
+                        for i in 0..selection_len {
+                            if let Ok(range) = selection.GetElement(i) {
+                                if let Ok(text) = range.GetText(-1) {
+                                    let text_str = text.to_string();
+                                    if !text_str.trim().is_empty() {
+                                        return Some(text_str);
                                     }
                                 }
-                                Err(e) => println!("无法将 Pattern 转换为 TextPattern: {:?}", e),
                             }
-                        }
-                        Err(_) => {
-                            println!("此焦点元素不支持文本模式 (TextPattern)。");
                         }
                     }
                 }
-                Err(e) => println!("获取焦点元素失败: {:?}", e),
+            }
+        }
+
+        // 方法2: 尝试 ValuePattern (适用于输入框)
+        if let Ok(pattern_unknown) = element.GetCurrentPattern(UIA_ValuePatternId) {
+            if let Ok(value_pattern) = pattern_unknown.cast::<IUIAutomationValuePattern>() {
+                if let Ok(value) = value_pattern.CurrentValue() {
+                    let value_str = value.to_string();
+                    if !value_str.trim().is_empty() {
+                        return Some(format!("[输入框内容] {}", value_str));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    // 检查元素是否是文本相关的控件
+    unsafe fn is_text_element(element: &IUIAutomationElement) -> bool {
+        if let Ok(control_type) = element.CurrentControlType() {
+            let type_id = control_type.0;
+            type_id == UIA_EditControlTypeId.0 || 
+            type_id == UIA_DocumentControlTypeId.0 || 
+            type_id == UIA_TextControlTypeId.0
+        } else {
+            false
+        }
+    }
+
+    // 获取窗口信息
+    unsafe fn get_window_info(hwnd: HWND) -> String {
+        let mut buffer = [0u16; 256];
+        let len = GetWindowTextW(hwnd, &mut buffer);
+        if len > 0 {
+            String::from_utf16_lossy(&buffer[..len as usize])
+        } else {
+            "未知窗口".to_string()
+        }
+    }
+
+    pub fn run() {
+        println!("方法二：改进的 UI Automation 模式已启动。");
+        println!("这个版本会持续监听焦点变化和文本选择。");
+        println!("支持多种控件类型：编辑框、文档、富文本等。");
+        println!("退出方式：按 Ctrl+C 退出程序");
+        println!("\n[提示] 请在不同的应用中选择文本，程序会自动检测...");
+
+        SHOULD_EXIT.store(false, Ordering::Relaxed);
+
+        unsafe {
+            if let Err(e) = CoInitializeEx(None, COINIT_MULTITHREADED) {
+                println!("[错误] COM 初始化失败: {:?}", e);
+                return;
             }
 
+            let automation: IUIAutomation = match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+                Ok(inst) => inst,
+                Err(e) => {
+                    println!("[错误] 创建 UI Automation 实例失败: {:?}", e);
+                    CoUninitialize();
+                    return;
+                }
+            };
+
+            println!("[状态] UI Automation 已初始化，开始监听...");
+
+            let mut last_window: Option<HWND> = None;
+            let mut last_text = String::new();
+            let mut check_count = 0;
+
+            loop {
+                if SHOULD_EXIT.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                check_count += 1;
+                if check_count % 20 == 0 { // 每10秒显示一次状态
+                    println!("[状态] 持续监听中... (已检查 {} 次)", check_count);
+                }
+
+                // 获取当前前台窗口
+                let current_window = GetForegroundWindow();
+                if current_window.0 == 0 {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+
+                // 检查窗口是否变化
+                let window_changed = last_window.map_or(true, |last| last != current_window);
+                if window_changed {
+                    let window_title = get_window_info(current_window);
+                    println!("[事件] 窗口切换到: {}", window_title);
+                    last_window = Some(current_window);
+                }
+
+                // 尝试获取焦点元素
+                match automation.GetFocusedElement() {
+                    Ok(focused_element) => {
+                        // 检查是否是文本相关元素
+                        if is_text_element(&focused_element) {
+                            if let Some(selected_text) = try_get_selected_text(&focused_element) {
+                                // 避免重复显示相同内容
+                                if selected_text != last_text && selected_text.len() > 2 {
+                                    println!("\n--- [UIA 捕获内容] ---");
+                                    println!("{}", selected_text);
+                                    println!("--- [内容结束] ---\n");
+                                    last_text = selected_text;
+                                }
+                            }
+                        }
+
+                        // 也尝试获取鼠标位置的元素
+                        let mut cursor_pos = POINT { x: 0, y: 0 };
+                        if GetCursorPos(&mut cursor_pos).is_ok() {
+                            let hwnd_under_cursor = WindowFromPoint(cursor_pos);
+                            if hwnd_under_cursor.0 != 0 && hwnd_under_cursor != current_window {
+                                if let Ok(element_under_cursor) = automation.ElementFromHandle(hwnd_under_cursor) {
+                                    if is_text_element(&element_under_cursor) {
+                                        if let Some(text) = try_get_selected_text(&element_under_cursor) {
+                                            if text != last_text && text.len() > 2 {
+                                                println!("\n--- [鼠标位置文本] ---");
+                                                println!("{}", text);
+                                                println!("--- [内容结束] ---\n");
+                                                last_text = text;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // 焦点元素获取失败，这很常见，不需要报错
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(500)); // 每500ms检查一次
+            }
+
+            println!("[状态] UI Automation 监听已停止。");
             CoUninitialize();
         }
     }
@@ -457,7 +558,7 @@ fn main() {
 
         match choice.trim() {
             "1" => clipboard_poller::run(),
-            "2" => ui_automation_conceptual::run(),
+            "2" => ui_automation_improved::run(),
             "3" => global_hook_simulator::run(),
             "q" | "Q" => {
                 println!("程序退出。");
